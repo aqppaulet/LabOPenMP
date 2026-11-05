@@ -1,7 +1,9 @@
+#define _XOPEN_SOURCE 700
 #include "lista.h"
 
 #include <limits.h>
 #include <omp.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +11,6 @@
 typedef struct Node {
     int key;
     struct Node *next;
-    omp_lock_t lock;
 } Node;
 
 typedef struct {
@@ -42,7 +43,6 @@ static void list_free(Node **head)
     while (*head != NULL) {
         Node *old = *head;
         *head = old->next;
-        omp_destroy_lock(&old->lock);
         free(old);
     }
 }
@@ -60,7 +60,6 @@ static int list_insert(Node **head, int key)
         return -1;
     node->key = key;
     node->next = *link;
-    omp_init_lock(&node->lock);
     *link = node;
     return 1;
 }
@@ -81,7 +80,6 @@ static int list_delete(Node **head, int key)
         return 0;
     Node *old = *link;
     *link = old->next;
-    omp_destroy_lock(&old->lock);
     free(old);
     return 1;
 }
@@ -98,7 +96,6 @@ static int list_initial(Node **head, size_t count)
         }
         node->key = (int)i;
         node->next = NULL;
-        omp_init_lock(&node->lock);
         *tail = node;
         tail = &node->next;
     }
@@ -202,63 +199,14 @@ static int list_verify(const Node *head, const ListWorkload *work, size_t *count
     return node == NULL && *count == work->nodes - work->deletions;
 }
 
-/* Acoplamiento de bloqueos: se adquiere el nodo siguiente antes de soltar
- * el actual. head_guard protege el enlace inicial, sin valor centinela. */
-static int list_member_nodes(Node **head, omp_lock_t *head_guard, int key)
+/* Un fallo de pthreads deja de garantizar exclusión mutua. Terminar evita
+ * continuar con memoria compartida sin protección. */
+static void pthread_check(int error)
 {
-    omp_set_lock(head_guard);
-    Node *current = *head;
-    if (current != NULL)
-        omp_set_lock(&current->lock);
-    omp_unset_lock(head_guard);
-    while (current != NULL && current->key < key) {
-        Node *next = current->next;
-        if (next != NULL)
-            omp_set_lock(&next->lock);
-        omp_unset_lock(&current->lock);
-        current = next;
+    if (error != 0) {
+        fprintf(stderr, "Error de sincronizacion pthreads: %s\n", strerror(error));
+        abort();
     }
-    int found = current != NULL && current->key == key;
-    if (current != NULL)
-        omp_unset_lock(&current->lock);
-    return found;
-}
-
-static int list_delete_nodes(Node **head, omp_lock_t *head_guard, int key)
-{
-    Node *previous = NULL;
-    omp_lock_t *previous_guard = head_guard;
-    omp_set_lock(previous_guard);
-    Node *current = *head;
-    if (current != NULL)
-        omp_set_lock(&current->lock);
-
-    while (current != NULL && current->key < key) {
-        Node *next = current->next;
-        if (next != NULL)
-            omp_set_lock(&next->lock);
-        omp_unset_lock(previous_guard);
-        previous = current;
-        previous_guard = &previous->lock;
-        current = next;
-    }
-    int removed = current != NULL && current->key == key;
-    if (removed) {
-        if (previous != NULL)
-            previous->next = current->next;
-        else
-            *head = current->next;
-        /* Con predecesor y actual bloqueados no hay otros usuarios ni
-         * esperadores del actual: llegar a él exige bloquear predecesor.
-         * Se destruye y libera ANTES de soltar esa guardia. */
-        omp_unset_lock(&current->lock);
-        omp_destroy_lock(&current->lock);
-        free(current);
-    } else if (current != NULL) {
-        omp_unset_lock(&current->lock);
-    }
-    omp_unset_lock(previous_guard);
-    return removed;
 }
 
 int list_run(const ListWorkload *work, ListStrategy strategy,
@@ -266,7 +214,7 @@ int list_run(const ListWorkload *work, ListStrategy strategy,
 {
     if (work == NULL || result == NULL || threads < 1 ||
         (strategy != LIST_SEQ && strategy != LIST_GLOBAL &&
-         strategy != LIST_NODE_LOCKS))
+         strategy != LIST_RWLOCK))
         return 0;
     memset(result, 0, sizeof(*result));
     Node *head;
@@ -276,11 +224,11 @@ int list_run(const ListWorkload *work, ListStrategy strategy,
     size_t searches = 0, hits = 0, deletions = 0, removed = 0;
     int threads_used = 1;
     omp_lock_t lock;
-    omp_lock_t head_guard;
+    pthread_rwlock_t rwlock;
     if (strategy == LIST_GLOBAL)
         omp_init_lock(&lock);
-    if (strategy == LIST_NODE_LOCKS)
-        omp_init_lock(&head_guard);
+    if (strategy == LIST_RWLOCK)
+        pthread_check(pthread_rwlock_init(&rwlock, NULL));
 
     const double start = omp_get_wtime();
     if (strategy == LIST_SEQ) {
@@ -322,7 +270,7 @@ int list_run(const ListWorkload *work, ListStrategy strategy,
         }
     } else {
         #pragma omp parallel num_threads(threads) default(none) \
-            shared(head, work, head_guard, threads_used) \
+            shared(head, work, rwlock, threads_used) \
             reduction(+:searches, hits, deletions, removed)
         {
             #pragma omp single
@@ -332,11 +280,15 @@ int list_run(const ListWorkload *work, ListStrategy strategy,
                 Operation operation = work->operations[i];
                 int success;
                 if (operation.deletion) {
-                    success = list_delete_nodes(&head, &head_guard, operation.key);
+                    pthread_check(pthread_rwlock_wrlock(&rwlock));
+                    success = list_delete(&head, operation.key);
+                    pthread_check(pthread_rwlock_unlock(&rwlock));
                     ++deletions;
                     removed += (size_t)success;
                 } else {
-                    success = list_member_nodes(&head, &head_guard, operation.key);
+                    pthread_check(pthread_rwlock_rdlock(&rwlock));
+                    success = list_member(head, operation.key);
+                    pthread_check(pthread_rwlock_unlock(&rwlock));
                     ++searches;
                     hits += (size_t)success;
                 }
@@ -346,8 +298,8 @@ int list_run(const ListWorkload *work, ListStrategy strategy,
     result->seconds = omp_get_wtime() - start;
     if (strategy == LIST_GLOBAL)
         omp_destroy_lock(&lock);
-    if (strategy == LIST_NODE_LOCKS)
-        omp_destroy_lock(&head_guard);
+    if (strategy == LIST_RWLOCK)
+        pthread_check(pthread_rwlock_destroy(&rwlock));
 
     result->searches = searches;
     result->hits = hits;
@@ -361,10 +313,9 @@ int list_run(const ListWorkload *work, ListStrategy strategy,
     return 1;
 }
 
-/* Prueba separada del benchmark: Member(k) y Delete(k) usan la misma clave.
- * Un bloqueo externo POR CLAVE protege el oráculo; no serializa claves
- * distintas, cuyos recorridos y eliminaciones continúan siendo concurrentes.
- * Estos bloqueos adicionales se usan SOLO aquí, nunca al medir rendimiento. */
+/* Prueba separada del benchmark: ahora Member(k) y Delete(k) pueden usar
+ * LA MISMA clave. El oráculo presente[] comparte exactamente la protección
+ * de la operación, por lo que se comprueba el orden real de ejecución. */
 static int list_overlap_test(ListStrategy strategy, int threads, unsigned seed)
 {
     ListWorkload *work = list_workload_create(257, 1024, 88, seed);
@@ -384,37 +335,29 @@ static int list_overlap_test(ListStrategy strategy, int threads, unsigned seed)
     memset(present, 1, sizeof(present));
     size_t errors = 0;
     omp_lock_t lock;
-    omp_lock_t head_guard;
-    omp_lock_t key_locks[321];
-    for (size_t key = 0; key < 321; ++key)
-        omp_init_lock(&key_locks[key]);
+    pthread_rwlock_t rwlock;
     if (strategy == LIST_GLOBAL)
         omp_init_lock(&lock);
     else
-        omp_init_lock(&head_guard);
+        pthread_check(pthread_rwlock_init(&rwlock, NULL));
 
     #pragma omp parallel for num_threads(threads) schedule(static) default(none) \
-        shared(head, work, present, strategy, lock, head_guard, key_locks) \
-        reduction(+:errors)
+        shared(head, work, present, strategy, lock, rwlock) reduction(+:errors)
     for (size_t i = 0; i < work->count; ++i) {
         Operation operation = work->operations[i];
-        omp_set_lock(&key_locks[operation.key]);
         if (strategy == LIST_GLOBAL) {
             omp_set_lock(&lock);
+        } else if (operation.deletion) {
+            pthread_check(pthread_rwlock_wrlock(&rwlock));
+        } else {
+            pthread_check(pthread_rwlock_rdlock(&rwlock));
         }
 
         int expected = (size_t)operation.key < work->nodes ?
             present[operation.key] : 0;
-        int actual;
-        if (strategy == LIST_GLOBAL) {
-            actual = operation.deletion ?
-                list_delete(&head, operation.key) :
-                list_member(head, operation.key);
-        } else {
-            actual = operation.deletion ?
-                list_delete_nodes(&head, &head_guard, operation.key) :
-                list_member_nodes(&head, &head_guard, operation.key);
-        }
+        int actual = operation.deletion ?
+            list_delete(&head, operation.key) :
+            list_member(head, operation.key);
         if (actual != expected)
             ++errors;
         if (operation.deletion)
@@ -422,14 +365,13 @@ static int list_overlap_test(ListStrategy strategy, int threads, unsigned seed)
 
         if (strategy == LIST_GLOBAL)
             omp_unset_lock(&lock);
-        omp_unset_lock(&key_locks[operation.key]);
+        else
+            pthread_check(pthread_rwlock_unlock(&rwlock));
     }
     if (strategy == LIST_GLOBAL)
         omp_destroy_lock(&lock);
     else
-        omp_destroy_lock(&head_guard);
-    for (size_t key = 0; key < 321; ++key)
-        omp_destroy_lock(&key_locks[key]);
+        pthread_check(pthread_rwlock_destroy(&rwlock));
 
     size_t final_nodes;
     int valid = errors == 0 && list_verify(head, work, &final_nodes);
@@ -438,28 +380,6 @@ static int list_overlap_test(ListStrategy strategy, int threads, unsigned seed)
     list_free(&head);
     list_workload_destroy(work);
     return valid;
-}
-
-static int list_node_edge_test(void)
-{
-    Node *head = NULL;
-    omp_lock_t head_guard;
-    omp_init_lock(&head_guard);
-    int passed = list_insert(&head, INT_MIN) == 1;
-    passed &= list_insert(&head, 0) == 1;
-    passed &= list_insert(&head, INT_MAX) == 1;
-    passed &= list_member_nodes(&head, &head_guard, INT_MIN);
-    passed &= list_member_nodes(&head, &head_guard, INT_MAX);
-    passed &= !list_delete_nodes(&head, &head_guard, -1);
-    passed &= list_delete_nodes(&head, &head_guard, INT_MIN);
-    passed &= list_delete_nodes(&head, &head_guard, INT_MAX);
-    passed &= list_delete_nodes(&head, &head_guard, 0);
-    passed &= head == NULL;
-    passed &= !list_member_nodes(&head, &head_guard, 0);
-    passed &= !list_delete_nodes(&head, &head_guard, 0);
-    list_free(&head);
-    omp_destroy_lock(&head_guard);
-    return passed;
 }
 
 int list_selftest(FILE *output)
@@ -475,9 +395,8 @@ int list_selftest(FILE *output)
     passed &= list_delete(&head, 4) && list_delete(&head, 2) &&
               list_delete(&head, 6) && !list_delete(&head, 6) && head == NULL;
     list_free(&head);
-    passed &= list_node_edge_test();
     if (output != NULL)
-        fprintf(output, "Lista: operaciones basicas, enteros extremos y vaciado por nodo: %s\n",
+        fprintf(output, "Lista: insercion, duplicados, busqueda y eliminacion: %s\n",
                 passed ? "OK" : "FALLO");
 
     const unsigned ratios[] = {100, 95, 80, 50};
@@ -490,7 +409,7 @@ int list_selftest(FILE *output)
             passed = 0;
             continue;
         }
-        for (int strategy = LIST_SEQ; strategy <= LIST_NODE_LOCKS; ++strategy) {
+        for (int strategy = LIST_SEQ; strategy <= LIST_RWLOCK; ++strategy) {
             size_t limit = strategy == LIST_SEQ ? 1 :
                 sizeof(thread_counts) / sizeof(thread_counts[0]);
             for (size_t t = 0; t < limit; ++t) {
@@ -508,7 +427,7 @@ int list_selftest(FILE *output)
         passed = 0;
     } else {
         ListResult result;
-        passed &= list_run(empty, LIST_NODE_LOCKS, 4, &result) && result.valid;
+        passed &= list_run(empty, LIST_RWLOCK, 4, &result) && result.valid;
         list_workload_destroy(empty);
         ++cases;
     }
@@ -518,7 +437,7 @@ int list_selftest(FILE *output)
 
     int overlap_passed = 1;
     size_t overlap_cases = 0;
-    for (int strategy = LIST_GLOBAL; strategy <= LIST_NODE_LOCKS; ++strategy) {
+    for (int strategy = LIST_GLOBAL; strategy <= LIST_RWLOCK; ++strategy) {
         for (size_t t = 1; t < sizeof(thread_counts) / sizeof(thread_counts[0]); ++t) {
             for (unsigned repetition = 0; repetition < 3; ++repetition) {
                 overlap_passed &= list_overlap_test((ListStrategy)strategy,

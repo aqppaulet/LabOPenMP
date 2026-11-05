@@ -54,7 +54,7 @@ static void write_summary(const Measurement *m, int reps, double seq) {
 }
 
 static int bench_list(int reps) {
-    const size_t nodes = 4000, operations = 8000;
+    const size_t nodes = 12000, operations = 24000;
     const unsigned percentages[] = {95, 80};
     for (size_t scenario = 0; scenario < 2; ++scenario) {
         unsigned percent = percentages[scenario];
@@ -63,7 +63,7 @@ static int bench_list(int reps) {
         Measurement m[1 + 2 * THREAD_COUNTS] = {0};
         for (int k = 0; k < 1 + 2 * THREAD_COUNTS; ++k) {
             m[k].problem = "lista";
-            m[k].method = k == 0 ? "secuencial" : k <= THREAD_COUNTS ? "global" : "por_nodo";
+            m[k].method = k == 0 ? "secuencial" : k <= THREAD_COUNTS ? "global" : "rwlock";
             m[k].n = nodes;
             m[k].operations = operations;
             m[k].searches = percent;
@@ -78,7 +78,7 @@ static int bench_list(int reps) {
             /* Rotar el orden reduce el sesgo de ejecutar siempre primero la base. */
             for (int offset = 0; offset < 1 + 2 * THREAD_COUNTS; ++offset) {
                 int k = (offset + rep) % (1 + 2 * THREAD_COUNTS);
-                ListStrategy strategy = k == 0 ? LIST_SEQ : k <= THREAD_COUNTS ? LIST_GLOBAL : LIST_NODE_LOCKS;
+                ListStrategy strategy = k == 0 ? LIST_SEQ : k <= THREAD_COUNTS ? LIST_GLOBAL : LIST_RWLOCK;
                 ListResult result;
                 if (!list_run(w, strategy, m[k].threads, &result) || !result.valid) {
                     fprintf(stderr, "Fallo de correctitud en lista, metodo %s.\n", m[k].method);

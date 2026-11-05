@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-typedef enum { LIST_SEQ, LIST_GLOBAL, LIST_NODE_LOCKS } ListStrategy;
+typedef enum { LIST_SEQ, LIST_GLOBAL, LIST_RWLOCK } ListStrategy;
 typedef struct ListWorkload ListWorkload;
 
 typedef struct {
